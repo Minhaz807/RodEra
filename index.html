@@ -8,6 +8,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <style>
 :root{
   --ink:#08211F; --deep:#0F3D35; --deep2:#145044;
@@ -223,6 +224,13 @@ details.calc[open]>summary{border-bottom:1px solid var(--line)}
 <div class="main">
   <div class="ribbon" id="ribbon"></div>
   <div class="wrap">
+
+  <!-- IMPORT -->
+  <section class="page" id="p-import">
+    <div class="phead"><h2>Import your workbook</h2>
+      <p>Upload a copy of your Bangladesh Solar Cost Model workbook (the same layout used to build this platform). Every sheet the parser recognises — equipment catalogues, assumptions, the SREDA register, the policy library — replaces the matching data here, and every calculation on every page updates from it immediately.</p></div>
+    <div id="importUI"></div>
+  </section>
 
   <!-- 1 SETUP -->
   <section class="page on" id="p-setup">
@@ -653,6 +661,56 @@ K("earth","Earthing","Earthing and lightning protection","Bonding every conducti
  ["IEC 62305-3 — Physical damage to structures and life hazard","IEC 62548 §8 — Earthing and bonding","BNBC — electrical installation provisions"],"solar plant earthing lightning protection design")
 ];
 REF.kbIndex = {}; REF.kb.forEach(k=>{REF.kbIndex[k.id]=k; REF.kbIndex[k.t.toLowerCase()]=k;});
+
+/* ---- Area unit conversions: 1 unit = N sft ---- */
+REF.areaUnits = {
+ sft:  [1,        "ft²"],
+ m2:   [10.7639,  "m²"],
+ acre: [43560,    "acre"],
+ decimal:[435.6,  "decimal"],
+ bigha:[14400,    "bigha (≈33 decimal, regional variation exists)"]
+};
+
+/* ---- REB/BPDB residential (LT-A) retail tariff slabs — as supplied by the user, Sep 2026 ----
+   These are the numbers the person typed in; they cover only the first four slabs.
+   Higher-consumption slabs exist in the real tariff order but were not supplied, so the
+   platform extends the highest given slab with a visible caveat rather than inventing a rate. */
+REF.rebSlabs = [
+ {from:0,  to:50,  rate:5.32, bn:"লাইফ লাইন", label:"Lifeline (0–50 units)"},
+ {from:0,  to:75,  rate:6.18, bn:"প্রথম ধাপ", label:"First step (0–75 units)"},
+ {from:76, to:200, rate:8.50, bn:"দ্বিতীয় ধাপ", label:"Second step (76–200 units)"},
+ {from:201,to:300, rate:9.10, bn:"তৃতীয় ধাপ", label:"Third step (201–300 units)"}
+];
+REF.rebSlabsSource = "Entered by the user (Sep 2026) as the current REB/BPDB residential (LT-A) retail slab structure. Only four slabs were supplied — the real BERC tariff order continues above 300 units. Verify the complete, current slab table against the BERC tariff order or your REB/DISCO bill before relying on this for anything beyond planning.";
+
+/* Marginal (top-slab) tariff for a given normal-category monthly consumption.
+   Net metering nets import against export, so self-consumption is treated as
+   displacing the *last, most expensive* units of a normal bill — the standard
+   way avoided-cost is read off a tiered residential tariff. */
+function slabTariff(monthlyKwh){
+ const slabs = REF.rebSlabs.filter(s=>s.label.indexOf("Lifeline")<0); // normal ladder, not the lifeline-only track
+ const top = slabs[slabs.length-1];
+ if(monthlyKwh<=0) return {rate:slabs[0].rate, slab:slabs[0], beyond:false};
+ for(const s of slabs){ if(monthlyKwh>=s.from && monthlyKwh<=s.to) return {rate:s.rate, slab:s, beyond:false}; }
+ if(monthlyKwh>top.to) return {rate:top.rate, slab:top, beyond:true};
+ return {rate:top.rate, slab:top, beyond:true};
+}
+
+/* ---- Cleaning & maintenance add-ons ----
+   Not part of the source workbook — the person explicitly asked for this category to be
+   added. Clearly tagged as a platform estimate throughout, exactly like every other
+   platform-derived figure in this build. */
+REF.cleaning = [
+ {id:"none", name:"None", basis:"—", rate:0, unit:"", note:"No dedicated cleaning system — manual ad-hoc cleaning only."},
+ {id:"manual", name:"Manual cleaning kit", basis:"lump sum", rate:4500, unit:"lump sum",
+  note:"Squeegee, soft-bristle brush, telescopic pole and a demineralised-water container. Lowest cost; needs scheduled labour and is the most water-frugal manual option."},
+ {id:"sprinkler", name:"Fixed sprinkler / misting system", basis:"per kWp", rate:220, unit:"BDT/kWp",
+  note:"Timer-controlled nozzles plumbed along the array, rinsing dust on a schedule. Low labour, higher water use; needs a water source and a small pump/tank at roof level."},
+ {id:"robot", name:"Robotic dry-cleaning system", basis:"per kWp", rate:1800, unit:"BDT/kWp",
+  note:"Waterless brush robot that traverses the rows on a schedule. Highest upfront cost, lowest water use and labour, and the least dependent on someone remembering to do it."}
+];
+REF.cleaningSource = "Platform estimate — not carried from the source workbook, which has no cleaning-system category. Added at the user's request. Treat as an indicative planning figure and get a vendor quote before committing capital, exactly as for every other price in this catalogue.";
+
 /* ============================================================
    CALCULATION ENGINE
    Pure functions over one state object. Nothing renders here.
@@ -660,15 +718,15 @@ REF.kbIndex = {}; REF.kb.forEach(k=>{REF.kbIndex[k.id]=k; REF.kbIndex[k.t.toLowe
 
 const A0 = { /* assumptions — provenance in REF.assumpMeta */
  fx:122, vat:.15, contSelf:.08, contEpc:.04, epcMarkup:.12, ownerEng:.03,
- dcac:1.15, modsPerString:20, gcr:.55, walkway:.12, bosArea:.5, setback:.05,
- usablePct:.85, htThreshold:200, pfSys:.9, sft:10.7639,
+ dcac:1.2, modsPerString:20, gcr:.70, walkway:.07, bosArea:.3, setback:.03,
+ usablePct:.70, htThreshold:200, pfSys:.9, sft:10.7639,
  debtRatio:.7, loanRate:.11, tenor:10, grace:1, disc:.12,
- tariff:9.5, exportTariff:5.5, escal:.04, life:20, degr:.006,
+ tariffMode:"slab", tariff:8.5, exportTariff:10.50, escal:.04, life:20, degr:.006,
  om:.012, omEsc:.06, clean:800, spares:.003, ins:.003,
  invReplYr:12, invReplPct:.85, batReplYr:8, batReplPct:.8,
- dod:.8, rte:.9, backupHrs:2, loadDerate:.82,
+ dod:.8, rte:.9, backupHrs:4, loadDerate:.82,
  lTemp:.07, lSoil:.04, lMis:.02, lDC:.015, lInv:.025, lAC:.01, lAvail:.01, lShade:0,
- dcPerKwp:4, acPerKwp:.6, route:"epc"
+ dcPerKwp:4, acPerKwp:.6, route:"self", cleaning:"none"
 };
 
 REF.assumpMeta = {
@@ -678,13 +736,13 @@ REF.assumpMeta = {
  contEpc:["Contingency — EPC turnkey","Workbook · Assumptions!B9","Contractor absorbs delivery risk under a fixed-price wrap."],
  epcMarkup:["EPC contractor markup","Workbook · Assumptions!B10","Turnkey overhead, margin, project management and warranty. 10–15% is typical for Bangladesh C&I solar."],
  ownerEng:["Owner's engineer / supervision","Workbook · Assumptions!B11","Independent consultant supervising a self-managed build, as % of base cost."],
- dcac:["DC:AC oversizing ratio","Workbook · Assumptions!B15","1.10–1.20 is standard practice for Bangladesh's irradiance profile."],
+ dcac:["DC:AC oversizing ratio","PLATFORM DEFAULT — 1.2 (AC:DC 1:1.2) per user instruction","Workbook default was 1.15; 1.10–1.20 is standard practice for Bangladesh's irradiance profile."],
  modsPerString:["Modules per string","Workbook · Assumptions!B16","Used to estimate string count for combiner sizing. Check against your actual string voltage design."],
- gcr:["Ground coverage ratio","Workbook · Assumptions!B17","Panel footprint ÷ array area including row spacing. 0.50–0.60 typical at ~10–15° tilt."],
- walkway:["Walkway / access allowance","Workbook · Assumptions!B18","Maintenance walkways, fire lanes and edge access."],
- bosArea:["Inverter / BOS area","Workbook · Assumptions!B19","sft per kWp for inverter platforms, combiner boxes and other BOS."],
- setback:["Edge / setback margin","Workbook · Assumptions!B20","Parapet setbacks and fire-code clearances."],
- usablePct:["Usable fraction of total area","PLATFORM DEFAULT","Not in the source workbook, which takes the entered area as already usable. Deducts stairwells, tanks, lift rooms, AC plant and shaded strips. Measure it if you can."],
+ gcr:["Ground coverage ratio","PLATFORM DEFAULT — tightened for compact small-roof racking","Workbook default was 0.55; a small home array in a low-tilt/East-West layout can reasonably run tighter (0.60–0.65) when fitting the roof matters more than maximising row-to-row yield."],
+ walkway:["Walkway / access allowance","PLATFORM DEFAULT — tightened for small residential arrays","Workbook default was 0.12; a small home array often needs less dedicated walkway than a large C&I roof."],
+ bosArea:["Inverter / BOS area","PLATFORM DEFAULT — reduced for a small hybrid inverter footprint","Workbook default was 0.5 sft/kWp; a wall-mounted residential hybrid inverter needs less roof area than a C&I inverter room."],
+ setback:["Edge / setback margin","PLATFORM DEFAULT — reduced for small residential roofs","Workbook default was 0.05."],
+ usablePct:["Usable fraction of total area","PLATFORM DEFAULT — 0.70, per user instruction (total area : solar area = 1 : 0.7)","Not in the source workbook, which takes the entered area as already usable. Deducts stairwells, tanks, lift rooms, AC plant, existing walkways and shaded strips. Use the additional-deduction field for specific known obstructions."],
  htThreshold:["HT interconnection threshold (kWp)","Workbook · Assumptions!B21","Capacity above which a dedicated distribution transformer is typically required."],
  pfSys:["Assumed system power factor","Workbook · Assumptions!B22","Used to convert kW to kVA for transformer sizing."],
  sft:["m² to sft conversion","Workbook · Assumptions!B25","Fixed constant: 1 m² = 10.7639 sft."],
@@ -693,8 +751,8 @@ REF.assumpMeta = {
  tenor:["Loan tenor (years)","Workbook · Assumptions!B30","Equal principal amortisation assumed."],
  grace:["Grace period (years)","Workbook · Assumptions!B31","Interest-only years before principal amortisation begins."],
  disc:["Discount rate (WACC)","Workbook · Assumptions!B32","Used to discount project and equity cash flows."],
- tariff:["Retail tariff — self-consumption (BDT/kWh)","Workbook · Assumptions!B33","Value of energy consumed behind the meter. Confirm the BERC-approved tariff for your consumer category."],
- exportTariff:["Export buyback rate (BDT/kWh)","PLATFORM DEFAULT","The source workbook values all generation at the single retail tariff. Under net metering, surplus settled quarterly is bought at BERC's bulk/avoided-cost rate, which is materially lower than retail. Set your DISCO's approved rate — this number moves the business case more than almost any other."],
+ tariff:["Retail tariff — self-consumption (BDT/kWh)","USER-PROVIDED (flat override) or REB slab (default) — see Tariff mode below","Workbook default was a flat 9.50. In slab mode this field is not used directly; the marginal REB/BPDB residential rate is computed from monthly consumption instead. Switch to flat mode to fix a single number."],
+ exportTariff:["Export buyback rate (BDT/kWh)","USER-PROVIDED — 10.50, the gazetted rooftop-solar surplus-export rate","Set per the Rooftop Solar Incentive Scheme (see Bangladesh RE page, item 20): BDT 10.50/kWh guaranteed for surplus exported from systems installed by 28 Feb 2027, valid 3 years. Confirm eligibility and the current rate with your DISCO before relying on it."],
  escal:["Annual tariff escalation","Workbook · Assumptions!B34","Assumed growth in grid tariff over the horizon."],
  life:["Project life (years)","Workbook · 20-Year Financial Model","Modelling horizon for cash flow, NPV and LCOE."],
  degr:["Annual PV degradation","Workbook · Assumptions!B36","Typical Tier-1 mono-PERC/TOPCon linear degradation, 0.5–0.7%/yr."],
@@ -709,7 +767,7 @@ REF.assumpMeta = {
  batReplPct:["Battery replacement cost (% original)","Workbook · Assumptions!B45","Net of falling battery prices."],
  dod:["Depth of discharge","Workbook · Site & Load Inputs!B14","Usable fraction of rated capacity. 0.80 typical for LiFePO4."],
  rte:["Battery round-trip efficiency","Workbook · Site & Load Inputs!B15","Energy out ÷ energy in over a full charge-discharge cycle."],
- backupHrs:["Backup duration (hours)","Workbook · Site & Load Inputs!B13","Hours of critical load the battery must carry."],
+ backupHrs:["Backup duration (hours)","USER-PROVIDED — 4 hours for the default residential case","Workbook default was 2 hours; set to 4 for the default homeowner scenario."],
  loadDerate:["Load-sizing system derate","Workbook · Load Calculation!G33","Inverter, wiring and soiling losses in the quick capacity-from-load calculation."],
  lTemp:["Temperature derating","Workbook · PV Engineering Reference §10","5–10%. High ambient plus humidity push module temperature well above STC."],
  lSoil:["Soiling","Workbook · PV Engineering Reference §10","2–8%. Dust, brick-kiln particulate near industrial zones, bird droppings."],
@@ -726,15 +784,17 @@ REF.assumpMeta = {
 /* ---------- state ---------- */
 function blankState(){
  return {
-  meta:{name:"Untitled solar project",client:"",userType:"",installType:"",division:"Dhaka",district:"Dhaka",upazila:"",date:new Date().toISOString().slice(0,10)},
-  site:{sysType:"ongrid",battery:false,inputMode:"area",areaVal:20000,areaUnit:"sft",len:0,wid:0,dimUnit:"ft",
-        sizingMode:"area",targetKwp:100},
+  /* Default landing state: 10 kWp residential home, hybrid + battery, RCC rooftop. */
+  meta:{name:"Home rooftop solar — 10 kWp hybrid",client:"",userType:"homeowner",installType:"rcc",
+        division:"Dhaka",district:"Dhaka",upazila:"",date:new Date().toISOString().slice(0,10)},
+  site:{sysType:"hybrid",battery:true,inputMode:"area",areaVal:0,areaUnit:"sft",extraDeduction:0,
+        len:0,wid:0,dimUnit:"ft",sizingMode:"capacity",targetKwp:10},
   loads:[], bill:{kwh:0,bdt:0,peak:0,use:false},
   A:Object.assign({},A0),
-  sel:{pv:"PV12",inv:"INV03",bat:"BAT06",dcb:"DCB2",mount:"MNT2",prot:"PRT1",tx:"TRF2",earth:"ERT1",
-       civil:"CIV2",nem:"NEM2",labor:"LAB2",logi:"LOG2",dccable:"DCC2",accable:"ACC2",
-       certs:{CRT1:true,CRT2:true,CRT3:true,CRT4:false,CRT5:false,CRT6:false},civilLump:0},
-  ov:{}, scenarios:[]
+  sel:{pv:"PV04",inv:"INV19",bat:"BAT06",dcb:"DCB1",mount:"MNT2",prot:"PRT1",tx:"TRF2",earth:"ERT1",
+       civil:"CIV2",nem:"NEM1",labor:"LAB2",logi:"LOG1",dccable:"DCC1",accable:"ACC1",
+       certs:{CRT1:false,CRT2:true,CRT3:false,CRT4:false,CRT5:false,CRT6:false},civilLump:0,cleaning:"none"},
+  ov:{}, scenarios:[], srcFile:null
  };
 }
 let S = blankState();
@@ -750,13 +810,16 @@ function areaSft(){
    return (+s.len||0)*(+s.wid||0)*f;
  }
  const v=+s.areaVal||0;
- return s.areaUnit==="m2" ? v*S.A.sft : v;
+ const u=REF.areaUnits[s.areaUnit]||REF.areaUnits.sft;
+ return v*u[0];
 }
 
 function calcRoof(){
  const A=S.A, m=pick(DB.pv,S.sel.pv);
  const total=areaSft();
- const usable=total*A.usablePct;
+ const extraDed=Math.max(0,+S.site.extraDeduction||0);
+ const usableGross=total*A.usablePct;
+ const usable=Math.max(0,usableGross-extraDed);
  const footPerKwp=(m.area_sft/m.wp)*1000;
  const arrayPerKwp=footPerKwp/A.gcr;
  const walkPerKwp=arrayPerKwp*A.walkway;
@@ -764,8 +827,14 @@ function calcRoof(){
  const sub=arrayPerKwp+walkPerKwp+bosPerKwp;
  const reqPerKwp=sub*(1+A.setback);
  const maxKwp=reqPerKwp>0?usable/reqPerKwp:0;
- return {total,usable,unusable:total-usable,footPerKwp,arrayPerKwp,walkPerKwp,bosPerKwp,sub,reqPerKwp,maxKwp,module:m,
+ return {total,usableGross,extraDed,usable,unusable:total-usableGross,footPerKwp,arrayPerKwp,walkPerKwp,bosPerKwp,sub,reqPerKwp,maxKwp,module:m,
    setbackPerKwp:reqPerKwp-sub};
+}
+/* Total site area implied by a target capacity, at the current usable fraction and deduction. */
+function areaForCapacity(kwp){
+ const r=calcRoof();
+ const usableNeeded=kwp*r.reqPerKwp + r.extraDed;
+ return r.total>0 || true ? usableNeeded/S.A.usablePct : 0;
 }
 
 /* ---------- load ---------- */
@@ -853,8 +922,11 @@ function calcDesign(){
  /* string voltage window, indicative */
  const vocEst=m.wp/ (m.wp>600?12:11.5);       /* indicative module Voc from Wp class */
  const stringVocCold=modsPerString*vocEst*1.05;
+ const parsedInvKw=invUnitKw(iv,undefined);
+ const invUKw=parsedInvKw||acKw||1;
+ const invQty=Math.max(1,Math.ceil((acKw||0.001)/invUKw));
  return {kwp,actualKwp,panels,m,iv,modsPerString,strings,acKw,dcac,box,boxes,batKwh,critical,pits,txKva,dcLen,acLen,
-   stringVocCold,vocEst,area:calcRoof()};
+   stringVocCold,vocEst,invUKw,invQty,invSizeKnown:!!parsedInvKw,area:calcRoof()};
 }
 
 /* ---------- BOQ / CAPEX ---------- */
@@ -887,6 +959,13 @@ function boq(){
  if(S.site.battery){const ad=DB.labor.find(x=>/Hybrid/i.test(x.model)); if(ad){labAmt+=kwp*ad.bdt; labNote+=" Battery integration add-on applied at "+fmt(ad.bdt)+" BDT/kWp.";}}
  lines.push({k:"labor",label:"Installation & labour",item:lb.model+(S.site.battery?" + hybrid add-on":""),qty:kwp,unit:"kWp",rate:labAmt/(kwp||1),amt:labAmt,note:labNote});
  const lg=pick(DB.logi,S.sel.logi); add("logi","Transportation & logistics",lg.model,1,"lump sum",lg.bdt,lg.src);
+ const cln=REF.cleaning.find(c=>c.id===(S.sel.cleaning||"none"))||REF.cleaning[0];
+ if(cln.id!=="none"){
+   const qty = cln.basis==="lump sum" ? 1 : kwp;
+   lines.push({k:"cleaning",label:"Cleaning system",item:cln.name,qty,unit:cln.unit,rate:cln.rate,amt:qty*cln.rate,note:cln.note});
+ } else {
+   lines.push({k:"cleaning",label:"Cleaning system",item:"None selected",qty:0,unit:"",rate:0,amt:0,note:"Manual ad-hoc cleaning only."});
+ }
  const base=lines.reduce((a,l)=>a+l.amt,0);
  return {lines,base,design:d};
 }
@@ -971,6 +1050,19 @@ function calcBalance(){
    curt:T("curt"),self,selfRate:gen>0?self/gen:0,solarShare:load>0?self/load:0,G,L};
 }
 
+/* ---------- tariff ---------- */
+/* In slab mode, the self-consumption value is the marginal REB/BPDB residential rate
+   for the household's monthly consumption (net metering nets import against export, so
+   self-consumption is read as displacing the last, most expensive units of a normal bill).
+   In flat mode, A.tariff is used exactly as entered. Either way this keeps S.A.tariff
+   in sync so every direct reference to it elsewhere in the UI shows the same number. */
+function currentTariff(){
+ if(S.A.tariffMode!=="slab") return {rate:+S.A.tariff||0, monthlyKwh:null, detail:null};
+ const monthlyKwh = calcLoad().annual/12;
+ const st = slabTariff(monthlyKwh);
+ return {rate:st.rate, monthlyKwh, detail:st};
+}
+
 /* ---------- finance ---------- */
 function npv(r,cf){return cf.reduce((a,c,i)=>a+c/Math.pow(1+r,i),0);}
 function irr(cf){
@@ -988,7 +1080,8 @@ function paybackYr(cum){
  return null;
 }
 function calcFin(){
- const A=S.A, C=calcCost(), B=calcBalance(), N=Math.round(A.life), capex=C.capex, kwp=C.kwp;
+ const A=S.A, TI=currentTariff(); A.tariff=TI.rate; /* sync flat/slab so every direct reference to A.tariff agrees */
+ const C=calcCost(), B=calcBalance(), N=Math.round(A.life), capex=C.capex, kwp=C.kwp;
  const debt=capex*A.debtRatio, equity=capex-debt;
  const principalYr=A.tenor>0?debt/A.tenor:0;
  let bal=debt;
@@ -1028,18 +1121,54 @@ function calcFin(){
   minD:dscrs.length?Math.min(...dscrs):null, avgD:dscrs.length?dscrs.reduce((x,y)=>x+y,0)/dscrs.length:null,
   roi:equity>0?Y.reduce((s,y)=>s+y.eq,0)/equity:0,
   yr1:Y[0], totalSave:Y.reduce((s,y)=>s+y.rev,0), totalOpex:Y.reduce((s,y)=>s+y.opex,0),
-  B,C,N};
+  tariffInfo:TI, B,C,N};
 }
 
 /* ---------- auto-select equipment to match the project ---------- */
+/* Rated kW parsed from an inverter's model string, e.g. "GW10K-ET (10kW hybrid)" -> 10.
+   Returns fallback (or undefined) when the model string carries no explicit kW figure
+   (e.g. "Sunny Central (central inverter block, MW-scale)") — callers must not treat an
+   unparsed unit as automatically sized to whatever capacity they're solving for. */
+function invUnitKw(inv,fallback){
+ const m=(inv.model.match(/\(?\s*(\d+(?:\.\d+)?)\s*kW/i)); return m?parseFloat(m[1]):fallback;
+}
+/* Picks the inverter needing the fewest physical units to cover acKw, then the
+   cheapest Tier-1 option among those tied on unit count. Candidates with no parseable
+   unit size (so real quantity can't be computed) are only used as a last resort. */
+function bestInverter(pool,acKw){
+ let best=null;
+ pool.forEach(i=>{
+  const parsed=invUnitKw(i,undefined);
+  const unitKw=parsed||acKw||1;
+  const qty=Math.max(1,Math.ceil((acKw||0.001)/unitKw));
+  const score=(parsed?0:5e8) + qty*1e7 + (i.tier==="Tier 1"?0:2e5) + i.bdt;
+  if(!best||score<best.score) best={id:i.id,qty,unitKw,score,unknownSize:!parsed};
+ });
+ return best;
+}
+/* Picks a high-wattage bifacial Tier-1 module near 620-660 Wp when one exists (the
+   "best technology" default), otherwise the highest-efficiency Tier-1 module available. */
+function bestModule(){
+ const bif=DB.pv.filter(p=>p.tier==="Tier 1"&&/bifacial/i.test(p.spec)&&p.wp>=600&&p.wp<=680);
+ if(bif.length) return bif.sort((a,b)=>a.bdt_wp-b.bdt_wp)[0].id;
+ const t1=DB.pv.filter(p=>p.tier==="Tier 1");
+ if(t1.length) return t1.sort((a,b)=>b.wp-a.wp)[0].id;
+ return DB.pv[0]?.id;
+}
 function autoSelect(){
- const kwp=capacity(), it=S.meta.installType;
- const invOrder=kwp<15?["INV1","INV11","INV5"]:kwp<60?["INV3","INV6","INV9"]:kwp<200?["INV20","INV16","INV22"]:["INV4","INV7","INV10"];
+ const kwp=capacity(), it=S.meta.installType, acKw=kwp/S.A.dcac;
+ const bm=bestModule(); if(bm) S.sel.pv=bm;
  if(S.site.battery||S.site.sysType!=="ongrid"){
    const hy=DB.inv.filter(i=>/hybrid/i.test(i.spec));
-   const t=hy.find(i=>Math.abs(parseFloat((i.model.match(/(\d+)kW/)||[0,20])[1])-kwp/S.A.dcac)<1e9);
-   if(t) S.sel.inv=t.id;
- } else { const f=invOrder.find(id=>DB.inv.some(i=>i.id===id)); if(f)S.sel.inv=f; }
+   const best=bestInverter(hy.length?hy:DB.inv, acKw);
+   if(best) S.sel.inv=best.id;
+   const li=DB.bat.filter(b=>/LiFePO4/i.test(b.spec));
+   if(li.length){ S.sel.bat=li.sort((a,b)=>a.bdt-b.bdt)[0].id; }
+ } else {
+   const str=DB.inv.filter(i=>!/hybrid/i.test(i.spec));
+   const best=bestInverter(str.length?str:DB.inv, acKw);
+   if(best) S.sel.inv=best.id;
+ }
  S.sel.mount = it==="ground"?"MNT1": it==="tin"?"MNT3": it==="flat"?"MNT4":"MNT2";
  S.sel.civil = it==="ground"?"CIV1":"CIV2";
  S.sel.labor = it==="tin"?"LAB1": it==="ground"?"LAB3":"LAB2";
@@ -1070,6 +1199,7 @@ const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 const esc=s=>String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
 const PAGES=[
+ ["Data source",[["import","Import workbook","⇪"]]],
  ["Design flow",[["setup","Setup","①"],["load","Load","②"],["roof","Roof","③"],["res","Resource","④"],
   ["design","System","⑤"],["equip","Equipment","⑥"],["gen","Generation","⑦"],["cost","CAPEX / OPEX","⑧"],["fin","Financial","⑨"]]],
  ["Review",[["dash","Dashboard","▦"],["scen","Scenarios","⇄"],["exp","Excel export","↓"]]],
@@ -1252,27 +1382,38 @@ function renderSetup(){
  <div class="card"><h3>Site area &amp; sizing<small>Enter area or capacity — the platform derives the other</small></h3><div class="cb">
   <div class="grid g3">
    ${selectF("Sizing method","site.sizingMode",[["area","Size from available area"],["capacity","Enter capacity directly"],["load","Calculate from load"]])}
-   ${selectF("Area entry","site.inputMode",[["area","Total area"],["dim","Length × width"]])}
+   ${S.site.sizingMode!=="dim"?selectF("Area entry","site.inputMode",[["area","Total area"],["dim","Length × width"]]):""}
    ${S.site.sizingMode==="capacity"?field("Target capacity (kWp)","site.targetKwp","number","min=0 step=0.1"):
      `<label class="f"><span>Resolved capacity</span><input type="text" value="${fmt(capacity(),1)} kWp" disabled></label>`}
   </div>
+  ${S.site.sizingMode==="capacity"?`
+  <div class="note"><b>Area needed for ${fmt(S.site.targetKwp,1)} kWp, at ${pc(S.A.usablePct)} usable:</b>
+   required solar/array area <span class="mono">${fmt(r.reqPerKwp*(+S.site.targetKwp||0),0)} ft²</span>
+   out of a total roof of <span class="mono">${fmt(areaForCapacity(+S.site.targetKwp||0),0)} ft²</span>
+   (<span class="mono">${fmt(areaForCapacity(+S.site.targetKwp||0)/S.A.sft,0)} m²</span>) —
+   total area : solar area = <b>1 : ${S.A.usablePct.toFixed(2)}</b> by construction of the usable fraction below.</div>`:""}
   <div class="grid g3">
    ${S.site.inputMode==="dim"?`
      ${field("Length","site.len","number","min=0 step=0.01")}
      ${field("Width","site.wid","number","min=0 step=0.01")}
      ${selectF("Unit","site.dimUnit",[["ft","feet (ft)"],["m","metres (m)"]])}`:`
-     ${field("Total area","site.areaVal","number","min=0 step=1")}
-     ${selectF("Unit","site.areaUnit",[["sft","square feet (ft²)"],["m2","square metres (m²)"]])}
-     <label class="f"><span>Equivalent</span><input type="text" disabled value="${fmt(r.total,0)} ft²  ·  ${fmt(r.total/S.A.sft,0)} m²"></label>`}
+     ${field(S.site.sizingMode==="capacity"?"Total roof area available (optional, for a fit check)":"Total area","site.areaVal","number","min=0 step=1")}
+     ${selectF("Unit","site.areaUnit",Object.entries(REF.areaUnits).map(([k,v])=>[k,v[1]]))}
+     <label class="f"><span>Equivalent</span><input type="text" disabled value="${fmt(r.total,0)} ft²  ·  ${fmt(r.total/S.A.sft,0)} m²  ·  ${fmt(r.total/REF.areaUnits.decimal[0],2)} decimal"></label>`}
   </div>
-  ${field("Usable fraction of total area","A.usablePct","number","min=0 max=1 step=0.01","0–1 · deducts tanks, stairwells, plant, shaded strips")}
+  <div class="grid g3">
+   ${field("Usable fraction of total area","A.usablePct","number","min=0 max=1 step=0.01","0–1 · total : solar area = 1 : this value")}
+   ${field("Existing obstructions to remove (ft²)","site.extraDeduction","number","min=0 step=1","old walkways, tank, stairwell, AC plant — on top of the usable fraction")}
+   <label class="f"><span>Net usable area after obstructions</span><input type="text" disabled value="${fmt(r.usable,0)} ft²"></label>
+  </div>
   ${calcBox("Maximum capacity from this site",
-   "usable        = total area × usable fraction\nfootprint/kWp = (module area ÷ module Wp) × 1000\narray/kWp     = footprint ÷ GCR\nrequired/kWp  = (array + walkway + BOS) × (1 + setback)\nmax kWp       = usable ÷ required/kWp",
-   [["Total area",fmt(r.total,0)+" ft²"],["Usable fraction",pc(S.A.usablePct)],["Usable area",fmt(r.usable,0)+" ft²"],
+   "usable gross  = total area × usable fraction\nusable net    = usable gross − existing obstructions\nfootprint/kWp = (module area ÷ module Wp) × 1000\narray/kWp     = footprint ÷ GCR\nrequired/kWp  = (array + walkway + BOS) × (1 + setback)\nmax kWp       = usable net ÷ required/kWp",
+   [["Total area",fmt(r.total,0)+" ft²"],["Usable fraction",pc(S.A.usablePct)],["Usable gross",fmt(r.usableGross,0)+" ft²"],
+    ["Obstructions removed",fmt(r.extraDed,0)+" ft²"],["Usable net",fmt(r.usable,0)+" ft²"],
     ["Module",esc(r.module.brand+" "+r.module.model)],["Module area",r.module.area_sft+" ft² @ "+r.module.wp+" Wp"],
     ["Required / kWp",r.reqPerKwp.toFixed(2)+" ft²"]],
    fmt(r.maxKwp,1)+" kWp",
-   "Method: source workbook, Roof &amp; Capacity Sizing!B11:B21. Usable fraction is a platform addition — the workbook treats entered area as already usable.")}
+   "Method: source workbook, Roof &amp; Capacity Sizing!B11:B21. Usable fraction and the obstruction deduction are platform additions — the workbook treats entered area as already usable.")}
  </div></div>
 
  <div class="card"><h3>Project identification</h3><div class="cb"><div class="grid g3">
@@ -1282,7 +1423,6 @@ function renderSetup(){
  </div></div></div>
 
  <div class="split" style="margin-top:4px">
-  <button class="btn p" data-go="load">Continue to load calculation →</button>
   <button class="btn" data-act="autosel">Re-apply equipment defaults for this configuration</button>
  </div>`;
 }
@@ -1382,7 +1522,7 @@ function renderLoad(){
    <div class="note ${Math.abs(C.annual/12-(+S.bill.kwh))/(+S.bill.kwh)>0.25?"w":""}">
     <b>Reconciliation.</b> Calculated monthly average is <b class="mono">${fmt(C.annual/12,0)} kWh</b> against a billed
     <b class="mono">${fmt(+S.bill.kwh,0)} kWh</b> — a variance of <b class="mono">${pc((C.annual/12-(+S.bill.kwh))/(+S.bill.kwh))}</b>.
-    ${+S.bill.bdt>0?`Implied effective tariff: <b class="mono">${(+S.bill.bdt/+S.bill.kwh).toFixed(2)} BDT/kWh</b> — consider setting this as the retail tariff on the Assumptions page, currently ${S.A.tariff}.`:""}
+    ${+S.bill.bdt>0?`Implied effective tariff: <b class="mono">${(+S.bill.bdt/+S.bill.kwh).toFixed(2)} BDT/kWh</b> — switch to flat tariff mode on the Financial page if you'd rather fix this number than use the computed REB slab rate, currently ${S.A.tariff.toFixed(2)}.`:""}
     ${+S.bill.peak>0?` Billed demand <b class="mono">${fmt(+S.bill.peak,1)} kW</b> against a calculated ${fmt(C.demand,1)} kW; implied demand factor ${(+S.bill.peak/(C.connected||1)).toFixed(3)}.`:""}
     A variance above about 25% usually means the equipment schedule is missing lines or the operating hours are optimistic.
    </div>`:""}
@@ -1413,8 +1553,8 @@ function renderLoad(){
 }
 
 const PRESETS={
- home:[["LED lighting",24,20,"W",1,230,.95,.9,6,7,.8,"evening"],["Ceiling fan",8,75,"W",1,230,.85,.9,10,7,.7,"day"],
-  ["Air conditioner 1.5 ton",2,1500,"W",1,230,.9,.9,7,7,.6,"evening"],["Refrigerator",1,200,"W",1,230,.85,.9,24,7,.5,"continuous"],
+ home:[["LED lighting",20,20,"W",1,230,.95,.9,6,7,.8,"evening"],["Ceiling fan",8,75,"W",1,230,.85,.9,10,7,.7,"day"],
+  ["Air conditioner 1.5 ton",1,1500,"W",1,230,.9,.9,7,7,.6,"evening"],["Refrigerator",1,200,"W",1,230,.85,.9,24,7,.5,"continuous"],
   ["Television",2,120,"W",1,230,.95,.9,6,7,.8,"evening"],["Water pump 1 HP",1,1,"HP",1,230,.8,.82,2,7,.5,"day"]],
  office:[["LED panel lighting",120,36,"W",3,400,.95,.9,10,6,.9,"business"],["Split AC 2 ton",14,2000,"W",1,230,.9,.9,9,6,.75,"business"],
   ["Desktop / workstation",90,180,"W",1,230,.95,.9,9,6,.8,"business"],["Server rack + UPS",2,3500,"W",1,230,.95,.9,24,7,.9,"continuous"],
@@ -1477,7 +1617,8 @@ function renderRoof(){
    <table style="margin-top:14px"><thead><tr><th>Stage</th><th class="n">ft²</th><th class="n">m²</th><th class="n">ft²/kWp</th><th class="n">% of total</th><th>Basis</th></tr></thead><tbody>
     <tr><td><b>Total site area</b></td><td class="n">${fmt(r.total,0)}</td><td class="n">${fmt(r.total/A.sft,0)}</td><td class="n">—</td><td class="n">100%</td><td class="sm mut">As entered</td></tr>
     <tr><td>Less non-usable</td><td class="n">−${fmt(r.unusable,0)}</td><td class="n">−${fmt(r.unusable/A.sft,0)}</td><td class="n">—</td><td class="n">${pc(1-A.usablePct)}</td><td class="sm mut">Usable fraction ${pc(A.usablePct)}</td></tr>
-    <tr style="background:#F7F9F8"><td><b>Usable area</b></td><td class="n"><b>${fmt(r.usable,0)}</b></td><td class="n">${fmt(r.usable/A.sft,0)}</td><td class="n">—</td><td class="n">${pc(A.usablePct)}</td><td class="sm mut">Available to the array</td></tr>
+    ${r.extraDed>0?`<tr><td>Less existing obstructions</td><td class="n">−${fmt(r.extraDed,0)}</td><td class="n">−${fmt(r.extraDed/A.sft,0)}</td><td class="n">—</td><td class="n">${pc(r.extraDed/r.total)}</td><td class="sm mut">Old walkway, tank, stairwell etc. — entered on Setup</td></tr>`:""}
+    <tr style="background:#F7F9F8"><td><b>Usable area</b></td><td class="n"><b>${fmt(r.usable,0)}</b></td><td class="n">${fmt(r.usable/A.sft,0)}</td><td class="n">—</td><td class="n">${r.total>0?pc(r.usable/r.total):pc(A.usablePct)}</td><td class="sm mut">Available to the array</td></tr>
     <tr><td>PV panel footprint</td><td class="n">${fmt(used.panel,0)}</td><td class="n">${fmt(used.panel/A.sft,0)}</td><td class="n">${r.footPerKwp.toFixed(2)}</td><td class="n">${pc(used.panel/r.total)}</td><td class="sm mut">Module glass area only</td></tr>
     <tr><td>Row spacing / tilt allowance</td><td class="n">${fmt(used.row,0)}</td><td class="n">${fmt(used.row/A.sft,0)}</td><td class="n">${(r.arrayPerKwp-r.footPerKwp).toFixed(2)}</td><td class="n">${pc(used.row/r.total)}</td><td class="sm mut">GCR ${A.gcr}</td></tr>
     <tr><td>Walkway &amp; access</td><td class="n">${fmt(used.walk,0)}</td><td class="n">${fmt(used.walk/A.sft,0)}</td><td class="n">${r.walkPerKwp.toFixed(2)}</td><td class="n">${pc(used.walk/r.total)}</td><td class="sm mut">${pc(A.walkway)} of array area</td></tr>
@@ -1620,6 +1761,8 @@ function renderDesign(){
  <div class="card"><h3>Inverter</h3><div class="cb">
   <table><tbody>
    ${row("Selected inverter",esc(iv.brand+" "+iv.model),esc(iv.spec)+" · "+esc(iv.origin))}
+   ${d.invSizeKnown?row("Physical units required",fmt(d.invQty)+" × "+fmt(d.invUKw,1)+" kW","Fewest units that cover the required AC capacity"):
+     row("Physical units required","Not stated by model name","Check the datasheet for the unit's rated kW")}
    ${row("AC capacity required",fmt(d.acKw,2)+" kW","Capacity ÷ DC:AC ratio",
      calcBox("Inverter AC capacity","AC kW = kWp ÷ DC:AC ratio",[["Capacity",fmt(d.kwp,2)+" kWp"],["DC:AC",A.dcac]],fmt(d.acKw,2)+" kW AC","Source workbook, Inverters sheet"))}
    ${row("Pricing basis",esc(iv.unit)+" at "+bdt(iv.bdt),"Fractional kW is normal at planning stage — the workbook prices per AC kW rather than per unit")}
@@ -1673,44 +1816,82 @@ function renderDesign(){
 }
 
 /* ---------------- STEP 6 · EQUIPMENT ---------------- */
-let EQ={cat:"pv",q:"",tier:"",brand:"",sort:"price"};
+let EQ={cat:"pv",q:"",tier:"",brand:"",sort:"price_asc",sreda:false};
 const EQCATS=[["pv","PV modules",DB.pv],["inv","Inverters",DB.inv],["bat","Batteries",DB.bat],
  ["mount","Mounting",DB.mount],["dccable","DC cable",DB.dccable],["accable","AC cable",DB.accable],
  ["dcb","Combiner boxes",DB.dcb],["prot","Protection / MCB / SPD",DB.prot],["tx","Transformer & HT",DB.tx],
  ["earth","Earthing & lightning",DB.earth],["civil","Civil works",DB.civil],["nem","Net metering",DB.nem],
  ["labor","Installation labour",DB.labor],["logi","Transport & logistics",DB.logi]];
 
+/* SREDA cross-reference — brand-level match only (the register lists brand + model,
+   not a link back to a specific catalogue row), so this flags "brand appears on the
+   SREDA approved list", not "this exact SKU is certified". Said explicitly in the UI. */
+let SREDA_BRANDS=null;
+function sredaBrandSet(){
+ if(!SREDA_BRANDS){ SREDA_BRANDS=new Set(DB.sreda.map(s=>String(s.brand||"").toLowerCase().trim())); }
+ return SREDA_BRANDS;
+}
+function isSredaBrand(brand){
+ if(!brand) return false;
+ const set=sredaBrandSet(), b=String(brand).toLowerCase();
+ for(const s of set){ if(s && (b.includes(s)||s.includes(b))) return true; }
+ return false;
+}
+/* kWh parsed from a battery's model string, e.g. "Force H2 (14.2kWh module)" -> 14.2 */
+function batModuleKwh(b){ const m=b.model.match(/(\d+(?:\.\d+)?)\s*kWh/i); return m?parseFloat(m[1]):null; }
+
+const SORT_FIELDS={
+ pv:[["price_asc","Price: low → high"],["price_desc","Price: high → low"],
+     ["wp_desc","Wattage: high → low"],["wp_asc","Wattage: low → high"],
+     ["name_asc","Brand: A → Z"]],
+ inv:[["price_asc","Price: low → high"],["price_desc","Price: high → low"],
+     ["kw_asc","Rated kW: low → high"],["kw_desc","Rated kW: high → low"],
+     ["name_asc","Brand: A → Z"]],
+ bat:[["price_asc","Price: low → high"],["price_desc","Price: high → low"],
+     ["kwh_asc","Module kWh: low → high"],["kwh_desc","Module kWh: high → low"],
+     ["name_asc","Brand: A → Z"]],
+ default:[["price_asc","Price: low → high"],["price_desc","Price: high → low"],["name_asc","Name: A → Z"]]
+};
+function sortValue(i,field){
+ if(field==="price_asc"||field==="price_desc") return i.bdt_wp!==undefined?i.bdt_wp:(i.bdt||0);
+ if(field==="wp_asc"||field==="wp_desc") return i.wp||0;
+ if(field==="kw_asc"||field==="kw_desc") return invUnitKw(i,0)||0;
+ if(field==="kwh_asc"||field==="kwh_desc") return batModuleKwh(i)||0;
+ return String(i.brand||i.model||"");
+}
+
 function renderEquip(){
  const cat=EQCATS.find(c=>c[0]===EQ.cat)||EQCATS[0];
+ const isPV=EQ.cat==="pv";
  let items=cat[2].slice();
  if(EQ.q){const q=EQ.q.toLowerCase();
   items=items.filter(i=>JSON.stringify(i).toLowerCase().includes(q));}
  if(EQ.tier) items=items.filter(i=>i.tier===EQ.tier);
  if(EQ.brand) items=items.filter(i=>i.brand===EQ.brand);
- const unitPrice=i=>i.bdt_wp!==undefined?i.bdt_wp:i.bdt;
- if(EQ.sort==="price") items.sort((a,b)=>unitPrice(a)-unitPrice(b));
- if(EQ.sort==="brand") items.sort((a,b)=>String(a.brand||a.model).localeCompare(String(b.brand||b.model)));
- if(EQ.sort==="wp") items.sort((a,b)=>(b.wp||0)-(a.wp||0));
+ if(isPV && EQ.sreda) items=items.filter(i=>isSredaBrand(i.brand));
+ const fields=SORT_FIELDS[EQ.cat]||SORT_FIELDS.default;
+ const sortKey=fields.some(f=>f[0]===EQ.sort)?EQ.sort:fields[0][0];
+ const desc=/_desc$/.test(sortKey)||sortKey==="wp_desc"||sortKey==="kw_desc"||sortKey==="kwh_desc";
+ items.sort((a,b)=>{ const d=(sortValue(a,sortKey)>sortValue(b,sortKey))?1:(sortValue(a,sortKey)<sortValue(b,sortKey)?-1:0);
+   return sortKey==="name_asc"?d:(desc?-d:d); });
  const brands=[...new Set(cat[2].map(i=>i.brand).filter(Boolean))].sort();
  const tiers=[...new Set(cat[2].map(i=>i.tier).filter(t=>t&&t!=="-"))];
  const selId=S.sel[EQ.cat];
- const isPV=EQ.cat==="pv";
- const priceLabel=isPV?"BDT/Wp":(cat[2][0]?.unit?`BDT ${cat[2][0].unit}`:"BDT");
 
  const head=isPV
   ?`<th>Brand</th><th>Model</th><th>Tier</th><th class="n">Wp</th><th class="n">ft²</th><th class="n">BDT/Wp</th><th class="n">USD/Wp</th><th class="n">Warranty</th><th>Supplier</th><th>Origin</th>`
   :`<th>Brand / option</th><th>Model</th><th>Tier</th><th>Unit</th><th class="n">BDT</th><th class="n">USD</th><th class="n">Warranty</th><th>Supplier</th><th>Origin</th>`;
 
  const body=items.length?items.map(i=>{
-  const on=i.id===selId;
+  const on=i.id===selId; const srd=isPV&&isSredaBrand(i.brand);
   return `<tr${on?' style="background:#FDF8EF"':''}>
   <td><input type="radio" name="eqsel" data-eqsel="${i.id}" ${on?"checked":""}></td>
-  ${isPV?`<td><b>${esc(i.brand)}</b></td><td>${esc(i.model)}<div class="sm mut">${esc(i.spec)}</div></td>
+  ${isPV?`<td><b>${esc(i.brand)}</b>${srd?' <span class="tag ok" title="Brand appears on the SREDA approved-module register">SREDA brand</span>':''}</td><td>${esc(i.model)}<div class="sm mut">${esc(i.spec)}</div></td>
    <td><span class="tag ${i.tier==="Tier 1"?"t1":i.tier==="Tier 2"?"t2":"t3"}">${esc(i.tier)}</span></td>
    <td class="n">${i.wp}</td><td class="n">${i.area_sft}</td><td class="n"><b>${i.bdt_wp}</b></td>
    <td class="n">${(+i.usd_wp).toFixed(3)}</td><td class="n">${i.warranty}</td>
    <td class="sm">${esc(String(i.supplier||"").replace(/\s*\(indicative.*/,""))}</td><td class="sm mut">${esc(i.origin)}</td>`
-  :`<td><b>${esc(i.brand&&i.brand!=="-"?i.brand:i.model)}</b></td>
+  :`<td><b>${esc(i.brand&&i.brand!=="-"?i.brand:i.model)}</b>${EQ.cat==="inv"&&/hybrid/i.test(i.spec||"")?' <span class="tag bl">Hybrid</span>':''}</td>
    <td>${esc(i.brand&&i.brand!=="-"?i.model:"")}<div class="sm mut">${esc(i.spec||"")}</div></td>
    <td>${i.tier&&i.tier!=="-"?`<span class="tag ${i.tier==="Tier 1"?"t1":i.tier==="Tier 2"?"t2":"t3"}">${esc(i.tier)}</span>`:"—"}</td>
    <td class="sm">${esc(i.unit||(i.inputs?i.inputs+" inputs":"each"))}</td>
@@ -1722,19 +1903,19 @@ function renderEquip(){
 
  const sel=g(selId);
  $("#equipUI").innerHTML=`
- <div class="card"><h3>Catalogue<small>${cat[2].length} record${cat[2].length===1?"":"s"} in this category · ${items.length} shown</small></h3>
+ <div class="card"><h3>Catalogue<small>${cat[2].length} record${cat[2].length===1?"":"s"} in this category · ${items.length} shown${S.srcFile?" · from your imported workbook":""}</small></h3>
   <div class="filters">
    <select data-eq="cat">${EQCATS.map(c=>`<option value="${c[0]}" ${EQ.cat===c[0]?"selected":""}>${c[1]} (${c[2].length})</option>`).join("")}</select>
    <input type="text" data-eq="q" value="${esc(EQ.q)}" placeholder="Search brand, model, specification, supplier…">
    ${tiers.length?`<select data-eq="tier"><option value="">All tiers</option>${tiers.map(t=>`<option ${EQ.tier===t?"selected":""}>${esc(t)}</option>`).join("")}</select>`:""}
    ${brands.length>1?`<select data-eq="brand"><option value="">All brands</option>${brands.map(b=>`<option ${EQ.brand===b?"selected":""}>${esc(b)}</option>`).join("")}</select>`:""}
-   <select data-eq="sort"><option value="price" ${EQ.sort==="price"?"selected":""}>Sort: price</option>
-    <option value="brand" ${EQ.sort==="brand"?"selected":""}>Sort: name</option>
-    ${isPV?`<option value="wp" ${EQ.sort==="wp"?"selected":""}>Sort: wattage</option>`:""}</select>
+   <select data-eq="sort">${fields.map(([v,t])=>`<option value="${v}" ${sortKey===v?"selected":""}>${esc(t)}</option>`).join("")}</select>
+   ${isPV?`<label class="sm" style="display:flex;align-items:center;gap:5px;white-space:nowrap"><input type="checkbox" data-eqsreda ${EQ.sreda?"checked":""}> SREDA-listed brands only</label>`:""}
   </div>
   <div class="scroll"><table><thead><tr><th style="width:26px"></th>${head}<th></th></tr></thead><tbody>${body}</tbody></table></div>
   <div class="cb" style="border-top:1px solid var(--line2)">
-   <div class="note d"><b>No price, product, supplier or specification on this page was generated by the platform.</b> Every record is reproduced from the source workbook, including its own source note and caveats. The workbook records these as 2026 Bangladesh planning-stage market assumptions drawn from published retail and wholesale guides — bulk and EPC procurement normally comes in below retail. Get at least three live quotations before committing capital.</div>
+   ${isPV?`<div class="note">"SREDA brand" means the manufacturer name appears on the ${DB.sreda.length}-entry SREDA approved-module register (Bangladesh RE page) — a brand-level match, not confirmation that this exact wattage/model number is the certified one. Check the specific model against the live register at nsrra.sreda.gov.bd before relying on it for a net-metering application.</div>`:""}
+   <div class="note d"><b>No price, product, supplier or specification on this page was generated by the platform.</b> Every record is reproduced from ${S.srcFile?"your imported workbook":"the source workbook"}, including its own source note and caveats. Prices are planning-stage Bangladesh market assumptions — bulk and EPC procurement normally comes in below retail. Get at least three live quotations before committing capital.</div>
   </div></div>
 
  ${sel?`<div class="card"><h3>Current selection — ${esc(cat[1])}</h3><div class="cb">
@@ -1744,13 +1925,16 @@ function renderEquip(){
    ${kpi(isPV?sel.bdt_wp+" <i>৳/Wp</i>":(sel.usd?fmt(sel.usd,2)+" <i>USD</i>":"—"),isPV?"Unit price":"In USD")}
    ${kpi((sel.warranty&&sel.warranty!=="-")?sel.warranty+" <i>yr</i>":"—","Warranty","g")}
   </div>
+  ${EQ.cat==="inv"?(()=>{const d=calcDesign();
+    return d.invSizeKnown?`<div class="note">Sized for this project: <b class="mono">${fmt(d.invQty)}</b> unit(s) of ${fmt(d.invUKw,1)} kW each to cover ${fmt(d.acKw,1)} kW AC.</div>`
+     :`<div class="note w">This model's name doesn't state a unit kW rating, so the platform can't compute how many physical units it takes to cover ${fmt(d.acKw,1)} kW AC — check the datasheet.</div>`;})():""}
   <div class="calcbody" style="margin-top:12px"><dl>
    <dt>Model</dt><dd>${esc(sel.model)}</dd>
    <dt>Specification</dt><dd>${esc(sel.spec||"—")}</dd>
    <dt>Origin</dt><dd>${esc(sel.origin||"—")}</dd>
    <dt>BD supplier</dt><dd>${esc(sel.supplier||"—")}</dd>
    <dt>Source note</dt><dd>${esc(sel.src||"—")}</dd>
-   <dt>Record date</dt><dd>Carried from the source workbook, compiled September 2026</dd>
+   <dt>Record date</dt><dd>${S.srcFile?"From your imported workbook, "+esc(S.srcFile.at):"Carried from the source workbook, compiled September 2026"}</dd>
   </dl></div></div></div>`:""}
 
  ${isPV?`<div class="card"><h3>Price comparison — BDT per Wp</h3>
@@ -1760,6 +1944,12 @@ function renderEquip(){
  </div>`:`<div class="card"><h3>Price comparison</h3>
   ${chBar(items.map(i=>({l:String(i.model||"").slice(0,14),v:i.bdt,c:i.id===selId?"#E8A33D":"#1F7A5C"})),{h:180,l:64,fmtY:v=>crore(v)})}
  </div>`}
+
+ <div class="card"><h3>Cleaning &amp; maintenance system<small>Not part of the source workbook — added at your request</small></h3><div class="cb">
+  <div class="pills">${REF.cleaning.map(c=>`<div class="pill ${((S.sel.cleaning||"none")===c.id)?'on':''}" data-set="sel.cleaning" data-val="${c.id}">
+   <b>${esc(c.name)}</b><span>${esc(c.note)}</span>${c.rate>0?`<span style="display:block;margin-top:4px;font-weight:600;color:var(--amber-d)">${fmt(c.rate)} ${esc(c.unit)}</span>`:""}</div>`).join("")}</div>
+  <div class="note w">${esc(REF.cleaningSource)}</div>
+ </div></div>
 
  <div class="card"><h3>Certifications &amp; approvals<small>Tick what this project needs</small></h3><div class="cb">
   <table><thead><tr><th style="width:30px"></th><th>Approval</th><th class="n">Cost (BDT)</th><th>When it applies</th></tr></thead><tbody>
@@ -2020,15 +2210,24 @@ function renderFin(){
   ${field("Loan tenor (years)","A.tenor","number","min=1 max=25 step=1")}
   ${field("Grace period (years)","A.grace","number","min=0 max=5 step=1")}
   ${field("Discount rate (WACC)","A.disc","number","min=0.01 max=0.4 step=0.005")}
-  ${field("Retail tariff (৳/kWh)","A.tariff","number","min=0 step=0.1","value of self-consumption")}
-  ${field("Export buyback (৳/kWh)","A.exportTariff","number","min=0 step=0.1","BERC bulk rate")}
+  ${selectF("Self-consumption tariff mode","A.tariffMode",[["slab","REB/BPDB slab (marginal rate)"],["flat","Flat rate — set manually"]])}
+  ${A.tariffMode==="flat"?field("Retail tariff (৳/kWh)","A.tariff","number","min=0 step=0.1","value of self-consumption"):
+    `<label class="f"><span>Marginal slab rate (computed)</span><input type="text" disabled value="${F.tariffInfo.rate.toFixed(2)} ৳/kWh — ${esc(F.tariffInfo.detail?F.tariffInfo.detail.slab.label:"")}"></label>`}
+  ${field("Export buyback (৳/kWh)","A.exportTariff","number","min=0 step=0.1","gazetted rooftop incentive rate")}
   ${field("Tariff escalation","A.escal","number","min=0 max=0.2 step=0.005")}
   ${field("Project life (years)","A.life","number","min=5 max=30 step=1")}
   ${field("Degradation per year","A.degr","number","min=0 max=0.03 step=0.001")}
   <label class="f"><span>Debt amount</span><input type="text" disabled value="${bdt(F.debt)}"></label>
   <label class="f"><span>Equity amount</span><input type="text" disabled value="${bdt(F.equity)}"></label>
  </div>
- <div class="note w"><b>The export rate matters more than almost anything here.</b> The source workbook values all generation at the single retail tariff. Under the Net Metering Guidelines 2025 surplus is banked and settled quarterly at BERC's approved bulk rate, which is materially below retail. ${pc(B.exp/(B.gen||1))} of this plant's output is exported, so the difference between those two numbers is worth ${bdt(B.exp*(A.tariff-A.exportTariff))} in year one alone. Confirm the rate with your DISCO.</div>
+ ${A.tariffMode==="slab"?`<div class="cb" style="padding-top:0"><table><thead><tr><th>Slab</th><th class="n">Units (kWh/month)</th><th class="n">Rate (৳/kWh)</th><th></th></tr></thead><tbody>
+  ${REF.rebSlabs.map(s=>`<tr${F.tariffInfo.detail&&F.tariffInfo.detail.slab===s?' style="background:#FDF8EF"':''}><td>${esc(s.bn)} — ${esc(s.label)}</td><td class="n">${s.from}–${s.to}</td><td class="n">${s.rate.toFixed(2)}</td>
+   <td>${F.tariffInfo.detail&&F.tariffInfo.detail.slab===s?'<span class="tag ok">Marginal slab for this household</span>':''}</td></tr>`).join("")}
+  </tbody></table>
+  <div class="note">Household load implies <b class="mono">${fmt(F.tariffInfo.monthlyKwh,0)} kWh/month</b>. Net metering nets import against export, so self-consumption is valued at the marginal (top) slab that consumption reaches — the standard way to read avoided cost off a tiered bill.
+  ${F.tariffInfo.detail&&F.tariffInfo.detail.beyond?` This household's usage is above the highest slab the platform was given (৳${REF.rebSlabs[REF.rebSlabs.length-1].rate.toFixed(2)} for 201–300 units) — the real tariff order continues above 300 units at a rate not supplied here, so the top given rate is used as a conservative floor.`:""}
+  ${esc(REF.rebSlabsSource)}</div></div>`:""}
+ <div class="note w"><b>Export rate vs self-consumption rate.</b> The gazetted rooftop incentive pays <b class="mono">${A.exportTariff.toFixed(2)} ৳/kWh</b> for exported surplus, against a self-consumption value of <b class="mono">${F.tariffInfo.rate.toFixed(2)} ৳/kWh</b> here — ${A.exportTariff>F.tariffInfo.rate?"export is actually worth more per kWh than self-consumption at this household's slab, which is unusual and worth double-checking against your DISCO's current published rate.":"self-consumption is worth more per kWh than export, so shifting load into daylight hours is worth more than adding capacity."} ${pc(B.exp/(B.gen||1))} of this plant's output is exported.</div>
  </div></div>
 
  <div class="card"><h3>Cash flow</h3>
@@ -2301,6 +2500,27 @@ function showTerm(id){
 
 /* ---------------- BANGLADESH RE ---------------- */
 let BDT_={tab:"docs",q:"",cat:"",auth:"",year:""};
+const MONTH3={jan:1,feb:2,mar:3,apr:4,may:5,jun:6,jul:7,aug:8,sep:9,oct:10,nov:11,dec:12};
+/* Best-effort chronological score from the free-text date strings the workbook carries
+   ("2018", "August 2025", "Gazetted 28 May 2025 …", "2026-07-27"). Unparseable dates sort last. */
+function docDateScore(s){
+ s=String(s||"");
+ const iso=s.match(/(\d{4})-(\d{2})-(\d{2})/); if(iso) return +iso[1]*10000+ +iso[2]*100+ +iso[3];
+ const dmy=s.toLowerCase().match(/(\d{1,2})\s+([a-z]{3})[a-z]*\s+(\d{4})/);
+ if(dmy && MONTH3[dmy[2]]) return +dmy[3]*10000+MONTH3[dmy[2]]*100+ +dmy[1];
+ const my=s.toLowerCase().match(/([a-z]{3})[a-z]*\s+(\d{4})/);
+ if(my && MONTH3[my[1]]) return +my[2]*10000+MONTH3[my[1]]*100;
+ const y=s.match(/(\d{4})/); if(y) return +y[1]*10000;
+ return 0;
+}
+/* Renders a summary as bullets: split on "; " first (most workbook summaries use it),
+   falling back to sentence splits for the few that don't. */
+function bulletSum(sum){
+ let parts=String(sum||"").split(/;\s+/).map(x=>x.trim()).filter(Boolean);
+ if(parts.length<2) parts=String(sum||"").split(/(?<=\.)\s+(?=[A-Z(])/).map(x=>x.trim()).filter(Boolean);
+ if(parts.length<2) return `<p class="sm" style="margin:0">${esc(sum||"")}</p>`;
+ return `<ul class="sm" style="margin:0 0 0 -2px;padding-left:16px">${parts.map(p=>`<li>${esc(p.replace(/\.$/,""))}</li>`).join("")}</ul>`;
+}
 function renderBD(){
  const T_=BDT_;
  const tabs=[["docs","Policies & circulars ("+DB.docs.length+")"],["orgs","Institutions ("+REF.orgs.length+")"],
@@ -2312,6 +2532,7 @@ function renderBD(){
   if(T_.cat)d=d.filter(x=>x.cat===T_.cat);
   if(T_.auth)d=d.filter(x=>x.auth===T_.auth);
   if(T_.year)d=d.filter(x=>String(x.date||"").includes(T_.year));
+  d.sort((a,b)=>docDateScore(b.date)-docDateScore(a.date)); /* newest first, by default */
   const cats=[...new Set(DB.docs.map(x=>x.cat))], auths=[...new Set(DB.docs.map(x=>x.auth))].sort();
   const years=[...new Set(DB.docs.map(x=>(String(x.date||"").match(/20\d\d/)||[])[0]).filter(Boolean))].sort().reverse();
   body=`<div class="filters">
@@ -2319,15 +2540,14 @@ function renderBD(){
    <select data-bd="cat"><option value="">All categories</option>${cats.map(c=>`<option ${T_.cat===c?"selected":""}>${esc(c)}</option>`).join("")}</select>
    <select data-bd="auth"><option value="">All authorities</option>${auths.map(c=>`<option ${T_.auth===c?"selected":""}>${esc(c)}</option>`).join("")}</select>
    <select data-bd="year"><option value="">All years</option>${years.map(c=>`<option ${T_.year===c?"selected":""}>${esc(c)}</option>`).join("")}</select>
-   <span class="mut sm">${d.length} of ${DB.docs.length}</span></div>
-   <div class="scroll" style="max-height:640px"><table><thead><tr><th>#</th><th>Document</th><th>Authority</th><th>Date</th><th>Summary</th><th></th></tr></thead><tbody>
-   ${d.map(x=>`<tr><td class="n">${x.n}</td>
-    <td style="min-width:200px"><b>${esc(x.title)}</b><div><span class="tag bl">${esc(x.cat)}</span> <span class="tag">${esc(x.topic)}</span></div></td>
-    <td class="sm">${esc(x.auth)}</td><td class="sm mono">${esc(x.date)}</td>
-    <td class="sm" style="max-width:52ch">${esc(String(x.sum).slice(0,300))}${String(x.sum).length>300?"…":""}</td>
-    <td>${/^https?:/.test(x.url||"")?`<a class="btn sm" href="${esc(x.url)}" target="_blank" rel="noopener">Open</a>`:`<span class="sm mut">${esc(String(x.url||"").slice(0,40))}</span>`}</td></tr>`).join("")||`<tr><td colspan="6"><div class="empty">Nothing matches.</div></td></tr>`}
+   <span class="mut sm">${d.length} of ${DB.docs.length} · sorted newest first</span></div>
+   <div class="scroll" style="max-height:680px"><table><thead><tr><th>Document</th><th>Authority</th><th class="n">Date</th><th>Summary</th><th></th></tr></thead><tbody>
+   ${d.map(x=>`<tr><td style="min-width:190px"><b>${esc(x.title)}</b><div><span class="tag bl">${esc(x.cat)}</span> <span class="tag">${esc(x.topic)}</span></div></td>
+    <td class="sm">${esc(x.auth)}</td><td class="sm mono" style="white-space:nowrap">${esc(x.date)}</td>
+    <td style="max-width:48ch">${bulletSum(x.sum)}</td>
+    <td>${/^https?:/.test(x.url||"")?`<a class="btn sm" href="${esc(x.url)}" target="_blank" rel="noopener">Open</a>`:`<span class="sm mut">${esc(String(x.url||"").slice(0,40))}</span>`}</td></tr>`).join("")||`<tr><td colspan="5"><div class="empty">Nothing matches.</div></td></tr>`}
    </tbody></table></div>
-   <div class="cb"><div class="note w">Carried from the source workbook, compiled and cross-checked 19 September 2026. Government URLs are periodically restructured — verify each link is still live before relying on it in a submission.</div></div>`;
+   <div class="cb"><div class="note w">Sorted newest first, by a best-effort reading of each entry's date text — some workbook dates are only a year or an undated "rolling" notice, which sort to the bottom of their year. Carried from the source workbook, compiled and cross-checked 19 September 2026. Government URLs are periodically restructured — verify each link is still live before relying on it in a submission.</div></div>`;
  }
  if(T_.tab==="orgs"){
   body=`<div class="cb"><div class="grid g2">${REF.orgs.map(o=>`
@@ -2345,16 +2565,17 @@ function renderBD(){
   if(T_.q){const q=T_.q.toLowerCase();d=d.filter(x=>(x.brand+" "+x.model).toLowerCase().includes(q));}
   const brands=[...new Set(DB.sreda.map(x=>x.brand))].sort();
   if(T_.auth)d=d.filter(x=>x.brand===T_.auth);
+  d.sort((a,b)=>docDateScore(b.date)-docDateScore(a.date));
   body=`<div class="filters">
    <input type="text" data-bd="q" value="${esc(T_.q)}" placeholder="Search brand or model number…">
    <select data-bd="auth"><option value="">All brands (${brands.length})</option>${brands.map(b=>`<option ${T_.auth===b?"selected":""}>${esc(b)}</option>`).join("")}</select>
-   <span class="mut sm">${d.length} of ${DB.sreda.length}</span></div>
-   <div class="scroll" style="max-height:640px"><table><thead><tr><th>SREDA Sl.</th><th>Brand</th><th>Model</th><th class="n">Wp</th><th>Standards</th><th>Test lab</th><th>Certified</th></tr></thead><tbody>
+   <span class="mut sm">${d.length} of ${DB.sreda.length} · sorted newest first</span></div>
+   <div class="scroll" style="max-height:640px"><table><thead><tr><th>SREDA Sl.</th><th>Brand</th><th>Model</th><th class="n">Wp</th><th>Standards</th><th>Test lab</th><th class="n">Certified</th></tr></thead><tbody>
    ${d.map(x=>`<tr><td class="n">${x.sl}</td><td><b>${esc(x.brand)}</b></td><td class="mono sm">${esc(x.model)}</td>
     <td class="n">${x.wp}</td><td class="sm mut">${esc(String(x.std).replace(/BDS IEC /g,""))}</td>
     <td class="sm">${esc(x.lab)}</td><td class="mono sm">${esc(x.date)}</td></tr>`).join("")}
    </tbody></table></div>
-   <div class="cb"><div class="note">This is the certification list, not a price list — modules that have passed BSTI or BUET type-testing to IEC 61215/61730 and are therefore eligible for the net-metering programme. Both the module and the inverter must appear on SREDA's current register before a net-metering application will be accepted; using a non-listed brand is the commonest cause of rejection. Gaps in the serial numbers are entries withdrawn on the source registry.
+   <div class="cb"><div class="note">Every entry the source snapshot carried — ${DB.sreda.length} of ${DB.sreda.length}, none omitted — is listed above; use the search and brand filter to narrow it, not a shortened preview. This is the certification list, not a price list — modules that have passed BSTI or BUET type-testing to IEC 61215/61730 and are therefore eligible for the net-metering programme. Both the module and the inverter must appear on SREDA's current register before a net-metering application will be accepted; using a non-listed brand is the commonest cause of rejection. Gaps in the serial numbers are entries withdrawn on the source registry.
    <br><br><a href="https://nsrra.sreda.gov.bd/solar/nem/smodule/" target="_blank" rel="noopener">Check the live register at nsrra.sreda.gov.bd</a> before procurement — this snapshot was taken 19 September 2026.</div></div>`;
  }
  if(T_.tab==="epc"){
@@ -2673,9 +2894,15 @@ function buildWorkbook(){
   ["Equity amount",F.equity,""],
   ["Interest rate",A.loanRate,""],["Tenor (years)",A.tenor,""],["Grace (years)",A.grace,""],
   ["Discount rate (WACC)",A.disc,""],
-  ["Retail tariff (BDT/kWh)",A.tariff,"Value of self-consumption"],
-  ["Export buyback (BDT/kWh)",A.exportTariff,"BERC bulk rate — confirm with your DISCO"],
-  ["Tariff escalation",A.escal,""],["Degradation",A.degr,""],["Project life",A.life,""]
+  ["Tariff mode",A.tariffMode,A.tariffMode==="slab"?"Marginal REB/BPDB residential slab rate":"Flat rate, set manually"],
+  ["Self-consumption tariff (BDT/kWh)",F.tariffInfo.rate,A.tariffMode==="slab"?"Marginal slab: "+(F.tariffInfo.detail?F.tariffInfo.detail.slab.label:""):"Value of self-consumption"],
+  ["Household monthly consumption (kWh)",F.tariffInfo.monthlyKwh||"","Drives the slab lookup, from the load schedule"],
+  ["Export buyback (BDT/kWh)",A.exportTariff,"Gazetted rooftop-solar surplus rate — confirm with your DISCO"],
+  ["Tariff escalation",A.escal,""],["Degradation",A.degr,""],["Project life",A.life,""],null,
+  H("REB/BPDB residential slab table, as supplied"),
+  ["Slab","Units (kWh/month)","Rate (BDT/kWh)"],
+  ...REF.rebSlabs.map(s=>[s.label,s.from+"–"+s.to,s.rate]),
+  ["Note",REF.rebSlabsSource,""]
  ],[220,140,420]));
 
  sheets.push(sheetXML("Cash Flow",[TT("CASH FLOW"),null,
@@ -2848,27 +3075,8 @@ function renderExp(){
 
 /* ---------------- BRAND ---------------- */
 function renderBrand(){
- const names=[
-  ["RodEra","<b>Selected.</b> From <i>rod</i> (রোদ), Bengali for sunlight, given an engineering-sounding ending. Short, easy to say in Bengali and English, no existing solar brand collision, and it reads as a product rather than a department."],
-  ["Surya Setu","Sanskrit-rooted <i>surya</i> (sun) plus <i>setu</i> (bridge). Dignified, but 'Setu' is heavily used across Bangladeshi government platforms and would blend in rather than stand out."],
-  ["Alokpath","<i>Alok</i> (light) + <i>path</i> (way). Warm and legible, but reads more like an NGO programme than an engineering tool."],
-  ["Kiran Grid","<i>Kiran</i> (ray). Pairs the poetic with the technical. Slightly generic in the regional market."],
-  ["Roddur Works","<i>Roddur</i> is sunshine with a literary warmth to it. Charming but softer than a lender-facing tool wants."],
-  ["Tejas Solar","<i>Tej</i> (radiance, vigour). Strong sound, but 'Tejas' carries Indian defence-aviation associations."],
-  ["Prottasha Energy","<i>Prottasha</i> (expectation, hope). Common in Bangladeshi institutional naming, which cuts both ways."],
-  ["Bidyut Setu","<i>Bidyut</i> (electricity). Precise, but narrows the platform to the electrical side and loses the solar reference."],
-  ["Shaurya Platform","From <i>shaurya</i>, near-homophone of <i>shaur</i> (solar). The pun costs clarity."],
-  ["Meghna Renewables","River naming is well-established for Bangladeshi infrastructure, but it says nothing about what the product does."]
- ];
  $("#brandUI").innerHTML=`
- <div class="card"><h3>Naming shortlist</h3><div class="cb">
-  <table><thead><tr><th style="width:170px">Name</th><th>Reasoning</th></tr></thead><tbody>
-  ${names.map((n,i)=>`<tr${i===0?' style="background:#FDF8EF"':''}><td><b style="font-size:15px">${esc(n[0])}</b></td><td class="sm">${n[1]}</td></tr>`).join("")}
-  </tbody></table>
-  <div class="note"><b>Working name: RodEra.</b> Full form used in headers — <i>RodEra · Bangladesh Solar One-Stop Platform</i>.</div>
- </div></div>
-
- <div class="card"><h3>Mark</h3><div class="cb">
+ <div class="card"><h3>RodEra</h3><div class="cb">
   <div class="split" style="gap:26px;align-items:center;flex-wrap:wrap">
    <div style="background:#0A2E28;padding:22px;border-radius:12px">
     <svg width="96" height="96" viewBox="0 0 64 64"><circle cx="32" cy="15.5" r="4.6" fill="#2E9E77"/>
@@ -2886,38 +3094,14 @@ function renderBrand(){
       <rect x="19" y="32.3" width="26" height="5.4" rx="2.7"/><rect x="13.5" y="41.6" width="37" height="5.4" rx="2.7"/></g></svg>
     <div class="sm mut" style="margin-top:6px">Favicon / 48 px</div>
    </div>
-   <div style="flex:1;min-width:250px">
-    <p class="sm">Three amber bars widening downward under a green disc. It reads two ways at once, which is the point: sunlight falling on a tilted array, and a bar chart growing. Both halves of what the platform does — the engineering and the money — are in one mark.</p>
-    <p class="sm">The mark is original geometry drawn as inline SVG. It borrows nothing from the BIFFL logo: no shared letterforms, no shared silhouette, no derived shapes. What it shares is the colour language — institutional green paired with deep blue-teal — which is the brief's instruction and is not itself protectable.</p>
-   </div>
   </div>
- </div></div>
-
- <div class="card"><h3>Palette</h3><div class="cb">
-  <div class="grid g4">
-  ${[["#08211F","Ink","Body text, hard rules"],["#0F3D35","Deep teal","Navigation, mark ground, formula blocks"],
-    ["#1F7A5C","Institutional green","Positive results, BIFFL colour language"],["#2E9E77","Light green","Accents, the disc in the mark"],
-    ["#123C6B","Deep blue","Load and demand data"],["#2A6FB0","Mid blue","Secondary series, export energy"],
-    ["#E8A33D","Solar amber","The single accent — energy, generation, primary actions"],["#B4462F","Signal red","Failed checks and warnings only"]]
-   .map(([h,n,u])=>`<div><div style="height:52px;background:${h};border-radius:6px;border:1px solid rgba(0,0,0,.08)"></div>
-    <b class="mono sm" style="display:block;margin-top:5px">${h}</b><div class="sm">${esc(n)}</div>
-    <div class="sm mut">${esc(u)}</div></div>`).join("")}
-  </div>
-  <div class="note">Amber is spent in one place — energy and the primary action — so it keeps its force. Everything else is green for money and blue for load, which means colour carries meaning rather than decoration.</div>
- </div></div>
-
- <div class="card"><h3>Type</h3><div class="cb">
-  <p style="font-family:Archivo;font-size:27px;font-weight:600;letter-spacing:-.025em;margin:0 0 4px">Archivo — interface and headings</p>
-  <p class="sm mut" style="margin:0 0 14px">A grotesque with tight apertures and a slightly condensed cut. Holds up in dense tables and small labels, which is most of this product.</p>
-  <p class="mono" style="font-size:19px;font-weight:700;margin:0 0 4px">JetBrains Mono — 1,077,300 kWh · ৳91,451,792</p>
-  <p class="sm mut" style="margin:0">Every number in the platform. Tabular figures align in columns, which matters when a person is scanning a twenty-year cash flow for the year the DSCR dips. Monospace is doing structural work here, not styling.</p>
  </div></div>
 
  <div class="card"><h3>Downloads</h3><div class="cb"><div class="split">
   <button class="btn" data-act="svglight">Mark on dark (SVG)</button>
   <button class="btn" data-act="svgdark">Mark on light (SVG)</button>
   <button class="btn" data-act="favicon">Favicon (SVG)</button>
- </div><div class="note">All three are transparent-background SVG, so they scale to any size and drop into documents, slides or a website without a raster step.</div></div></div>`;
+ </div></div></div>`;
 }
 function dlSVG(kind){
  const bars=c=>`<g fill="${c}"><rect x="24.5" y="23" width="15" height="5.4" rx="2.7"/><rect x="19" y="32.3" width="26" height="5.4" rx="2.7"/><rect x="13.5" y="41.6" width="37" height="5.4" rx="2.7"/></g>`;
@@ -2933,11 +3117,25 @@ function dlSVG(kind){
 }
 
 /* ---------------- render dispatcher ---------------- */
-const RENDER={setup:renderSetup,load:renderLoad,roof:renderRoof,res:renderRes,design:renderDesign,
+const RENDER={import:renderImport,setup:renderSetup,load:renderLoad,roof:renderRoof,res:renderRes,design:renderDesign,
  equip:renderEquip,gen:renderGen,cost:renderCost,fin:renderFin,dash:renderDash,scen:renderScen,
  kb:renderKB,bd:renderBD,ref:renderRef,exp:renderExp,brand:renderBrand};
+const FLOW = PAGES.flatMap(([,items])=>items.map(i=>[i[0],i[1]]));
+function pageFooter(){
+ const i=FLOW.findIndex(x=>x[0]===PAGE);
+ if(i<0) return "";
+ const next=FLOW[i+1];
+ if(!next) return `<div class="split" style="margin-top:6px;padding-top:14px;border-top:1px solid var(--line)">
+   <button class="btn" data-go="setup">↺ Back to setup</button></div>`;
+ return `<div class="split" style="margin-top:6px;padding-top:14px;border-top:1px solid var(--line)">
+   <button class="btn p" data-go="${next[0]}">Continue to ${esc(next[1])} →</button></div>`;
+}
 function render(){
- try{ RENDER[PAGE] && RENDER[PAGE](); renderRibbon(); }
+ try{
+  RENDER[PAGE] && RENDER[PAGE](); renderRibbon();
+  const host=$("#p-"+PAGE); const ui=host&&host.querySelector("div[id$=UI]");
+  if(ui) ui.insertAdjacentHTML("beforeend", pageFooter());
+ }
  catch(e){ console.error(e);
   $("#p-"+PAGE).querySelector("div[id$=UI]").innerHTML=
    `<div class="note d"><b>Something in this view could not be calculated.</b> ${esc(e.message)}<br>
@@ -2956,13 +3154,16 @@ document.addEventListener("change",e=>{
   setPath(S,t.dataset.s,val);
   if(/^site\.(sizingMode|sysType|battery)$|^meta\.installType$/.test(t.dataset.s)) autoSelect();
   if(t.dataset.s==="meta.division"){const ds=Object.keys(REF.geo[S.meta.division].d);S.meta.district=ds[0];}
+  if(t.dataset.s==="site.sizingMode" && val==="load" && PAGE==="setup") return go("load");
   return render(); }
  if(t.dataset.l){ const [i,k]=t.dataset.l.split(".");
   S.loads[+i][k]=t.type==="checkbox"?t.checked:coerce(t.value); return render(); }
- if(t.dataset.eq){ EQ[t.dataset.eq]=t.value; if(t.dataset.eq==="cat"){EQ.brand="";EQ.tier="";} return render(); }
+ if(t.dataset.eq){ EQ[t.dataset.eq]=t.value; if(t.dataset.eq==="cat"){EQ.brand="";EQ.tier="";EQ.sort="price_asc";} return render(); }
+ if(t.hasAttribute&&t.hasAttribute("data-eqsreda")){ EQ.sreda=t.checked; return render(); }
  if(t.dataset.bd){ BDT_[t.dataset.bd]=t.value; return render(); }
  if(t.dataset.eqsel){ S.sel[EQ.cat]=t.dataset.eqsel; return render(); }
  if(t.dataset.cert){ S.sel.certs[t.dataset.cert]=t.checked; return render(); }
+ if(t.id==="wbFile"){ const f=t.files[0]; if(f) handleWorkbookFile(f); return; }
  if(t.id==="loadjson"){ const f=t.files[0]; if(!f)return;
   const rd=new FileReader(); rd.onload=()=>{try{ Object.assign(S,JSON.parse(rd.result)); render();
    $("#expStatus").innerHTML=`<div class="note"><b>Project loaded.</b></div>`;}
@@ -3025,12 +3226,236 @@ $("#burger").onclick=()=>$("#rail").classList.toggle("open");
 
 /* ---------------- init ---------------- */
 (function init(){
- S.meta.name="Rooftop solar feasibility";
- S.meta.userType="industry"; S.meta.installType="rcc";
- S.site.areaVal=20000; S.site.sizingMode="area";
- applyPreset("office");
+ /* Default landing state per spec: 10 kWp residential home, hybrid + battery,
+    RCC rooftop, sized directly from capacity (area follows at 70% usable),
+    ~4 kW connected load, 4-hour battery backup, REB slab tariff, 10.50 export. */
+ applyPreset("home");
  autoSelect();
  buildNav();
  render();
 })();
+/* ============================================================
+   WORKBOOK IMPORT — reads an uploaded .xlsx in the same layout as the
+   source workbook and replaces the matching parts of DB / S.A in place,
+   so every calculation on every page updates immediately.
+   ============================================================ */
+let IMPORT_LOG = null;
+
+function replaceArr(arr,items){ arr.length=0; if(items&&items.length) arr.push(...items); }
+
+function xRows(wb,name){
+ const ws=wb.Sheets[name]; if(!ws) return null;
+ return XLSX.utils.sheet_to_json(ws,{header:1,raw:true,defval:null});
+}
+/* Generic "is this a data row" test: col0 a positive integer id, col1 a non-empty string —
+   matches the layout of every catalogue/reference sheet in the source workbook regardless
+   of exactly which row the table happens to start on. */
+function dataRows(rows){
+ if(!rows) return [];
+ return rows.filter(r=>Array.isArray(r) && typeof r[0]==="number" && Number.isInteger(r[0]) && r[0]>0
+   && typeof r[1]==="string" && r[1].trim()!=="");
+}
+function toNum(v,d){ const n=+v; return isFinite(n)?n:(d!==undefined?d:0); }
+function toDateStr(v){
+ if(v instanceof Date) return v.toISOString().slice(0,10);
+ if(typeof v==="string") return v.slice(0,10);
+ return v==null?"":String(v);
+}
+
+function parseCatalogueSheet(wb,name,idPrefix,cols){
+ const rows=xRows(wb,name); if(!rows) return {ok:false,reason:"sheet not found"};
+ const d=dataRows(rows);
+ const out=d.map(x=>{
+  const o={id:idPrefix+x[0]};
+  cols.forEach((c,i)=>{ if(c) o[c]= i===0?x[0]:x[i]; });
+  if(o.bdt_wp!==undefined) o.bdt_wp=toNum(o.bdt_wp);
+  if(o.usd_wp!==undefined) o.usd_wp=+toNum(o.usd_wp).toFixed(4);
+  if(o.bdt!==undefined) o.bdt=toNum(o.bdt);
+  if(o.usd!==undefined) o.usd=+toNum(o.usd).toFixed(2);
+  if(o.wp!==undefined) o.wp=toNum(o.wp);
+  if(o.area_sft!==undefined) o.area_sft=toNum(o.area_sft);
+  if(o.inputs!==undefined) o.inputs=toNum(o.inputs,4);
+  return o;
+ });
+ return {ok:true, count:out.length, items:out};
+}
+
+function parseWorkbook(wb){
+ const log=[]; const D={};
+ const need=(key,label,cats)=>{
+  const r=parseCatalogueSheet(wb,label,cats.prefix,cats.cols);
+  if(r.ok && r.count>0){ D[key]=r.items; log.push({sheet:label,status:"ok",n:r.count}); }
+  else log.push({sheet:label,status:r.ok?"empty — kept existing data":"sheet not found — kept existing data",n:0});
+ };
+
+ need("pv","PV Modules",{prefix:"PV",cols:["","brand","tier","model","origin","supplier","spec","wp","area_sft","bdt_wp","usd_wp","warranty","src"]});
+ need("inv","Inverters",{prefix:"INV",cols:["","brand","tier","model","origin","supplier","spec","unit","bdt","usd","warranty","src"]});
+ need("bat","Battery Storage",{prefix:"BAT",cols:["","brand","tier","model","origin","supplier","spec","unit","bdt","usd","warranty","src"]});
+ need("dcb","DC Combiner Boxes",{prefix:"DCB",cols:["","model","spec","inputs","bdt","usd","src"]});
+ need("mount","Mounting Structure",{prefix:"MNT",cols:["","brand","tier","model","origin","supplier","spec","unit","bdt","usd","warranty","src"]});
+ need("prot","Protection Equipment",{prefix:"PRT",cols:["","brand","tier","model","origin","supplier","spec","unit","bdt","usd","warranty","src"]});
+ need("tx","Transformer & HT Switchgear",{prefix:"TRF",cols:["","brand","tier","model","origin","supplier","spec","unit","bdt","usd","warranty","src"]});
+ need("earth","Earthing & Lightning Protection",{prefix:"ERT",cols:["","brand","tier","model","origin","supplier","spec","unit","bdt","usd","warranty","src"]});
+ need("civil","Civil & Structural Works",{prefix:"CIV",cols:["","brand","tier","model","origin","supplier","spec","unit","bdt","usd","warranty","src"]});
+ need("nem","Net Metering & Interconnection",{prefix:"NEM",cols:["","brand","tier","model","origin","supplier","spec","unit","bdt","usd","warranty","src"]});
+ need("labor","Installation & Labor",{prefix:"LAB",cols:["","brand","tier","model","origin","supplier","spec","unit","bdt","usd","warranty","src"]});
+ need("logi","Transportation & Logistics",{prefix:"LOG",cols:["","brand","tier","model","origin","supplier","spec","unit","bdt","usd","warranty","src"]});
+
+ /* Cabling: one sheet, two stacked tables (DC then AC) using the same 1,2,3.. numbering twice.
+    Split on the point the id sequence resets. */
+ {
+  const rows=xRows(wb,"Cabling (DC & AC)");
+  if(rows){
+   const d=dataRows(rows); const dc=[],ac=[]; let prev=0,inAc=false;
+   d.forEach(x=>{ if(x[0]<=prev) inAc=true; prev=x[0];
+    const o={id:(inAc?"ACC":"DCC")+x[0],model:x[1],spec:x[2],unit:x[3],bdt:toNum(x[4]),usd:+toNum(x[5]).toFixed(4),src:x[6]};
+    (inAc?ac:dc).push(o); });
+   if(dc.length){D.dccable=dc; log.push({sheet:"Cabling (DC & AC) — DC block",status:"ok",n:dc.length});}
+   else log.push({sheet:"Cabling (DC & AC) — DC block",status:"empty — kept existing data",n:0});
+   if(ac.length){D.accable=ac; log.push({sheet:"Cabling (DC & AC) — AC block",status:"ok",n:ac.length});}
+   else log.push({sheet:"Cabling (DC & AC) — AC block",status:"empty — kept existing data",n:0});
+  } else log.push({sheet:"Cabling (DC & AC)",status:"sheet not found — kept existing data",n:0});
+ }
+
+ {
+  const rows=xRows(wb,"Certifications & Approvals");
+  if(rows){
+   const d=dataRows(rows);
+   D.certs=d.map(x=>({id:"CRT"+x[0],item:x[1],req:x[2],bdt:toNum(x[3]),src:x[5]}));
+   log.push({sheet:"Certifications & Approvals",status:"ok",n:D.certs.length});
+  } else log.push({sheet:"Certifications & Approvals",status:"sheet not found — kept existing data",n:0});
+ }
+
+ {
+  const rows=xRows(wb,"Load Calculation");
+  if(rows){
+   const d=dataRows(rows);
+   const lib=d.map(x=>({name:x[1],w:toNum(x[2]),hrs:toNum(x[4]),df:toNum(x[5],1)})).filter(x=>x.name);
+   if(lib.length){ D.loadlib=lib; log.push({sheet:"Load Calculation (equipment library)",status:"ok",n:lib.length}); }
+   else log.push({sheet:"Load Calculation (equipment library)",status:"empty — kept existing data",n:0});
+  } else log.push({sheet:"Load Calculation",status:"sheet not found — kept existing data",n:0});
+ }
+
+ {
+  const rows=xRows(wb,"Circulars");
+  if(rows){
+   const d=dataRows(rows);
+   D.docs=d.map(x=>({n:x[0],cat:x[1],title:x[2],auth:x[3],topic:x[4],sum:x[5],date:toDateStr(x[6]),url:x[7]}));
+   log.push({sheet:"Circulars",status:"ok",n:D.docs.length});
+  } else log.push({sheet:"Circulars",status:"sheet not found — kept existing data",n:0});
+ }
+
+ {
+  const rows=xRows(wb,"SREDA Approved Equipment (NEM)");
+  if(rows){
+   const d=dataRows(rows);
+   D.sreda=d.map(x=>({sl:x[0],brand:x[1],model:x[2],wp:toNum(x[3]),std:x[4],lab:x[5],date:toDateStr(x[6])}));
+   log.push({sheet:"SREDA Approved Equipment (NEM)",status:"ok",n:D.sreda.length});
+  } else log.push({sheet:"SREDA Approved Equipment (NEM)",status:"sheet not found — kept existing data",n:0});
+ }
+
+ /* Assumptions: fuzzy-matched by label text against the known assumption keys, since row
+    position isn't reliable across edited copies of the workbook. Only confident matches
+    are applied; everything else is left at its current value and reported as unmatched. */
+ const ASSUMP_PATTERNS = [
+  [/exchange rate/i,"fx"], [/vat/i,"vat"],
+  [/contingency.*self|self.*contingency/i,"contSelf"], [/contingency.*epc|epc.*contingency/i,"contEpc"],
+  [/epc.*markup/i,"epcMarkup"], [/owner.*engineer|supervision/i,"ownerEng"],
+  [/dc\s*[:\/]\s*ac/i,"dcac"], [/modules per string/i,"modsPerString"],
+  [/ground coverage/i,"gcr"], [/walkway/i,"walkway"], [/inverter\s*\/?\s*bos area|bos area/i,"bosArea"],
+  [/edge.*setback|setback.*margin/i,"setback"], [/ht.*threshold|threshold.*capacity/i,"htThreshold"],
+  [/power factor/i,"pfSys"], [/square metre|sft.*conversion|m2.*sft/i,"sft"],
+  [/debt.*equity|debt share/i,"debtRatio"], [/loan interest/i,"loanRate"], [/loan tenor/i,"tenor"],
+  [/grace period/i,"grace"], [/discount rate/i,"disc"],
+  [/tariff escalation/i,"escal"], [/tariff|buyback/i,"tariff"],
+  [/specific yield/i,null], [/degradation/i,"degr"],
+  [/o&m.*escalation|o&m annual escalation/i,"omEsc"], [/o&m cost/i,"om"],
+  [/cleaning cost/i,"clean"], [/spare parts/i,"spares"], [/insurance/i,"ins"],
+  [/inverter replacement year/i,"invReplYr"], [/inverter replacement cost/i,"invReplPct"],
+  [/battery replacement cycle/i,"batReplYr"], [/battery replacement cost/i,"batReplPct"]
+ ];
+ {
+  const rows=xRows(wb,"Assumptions");
+  const applied=[], skipped=[];
+  if(rows){
+   rows.forEach(r=>{
+    if(!Array.isArray(r)) return;
+    const label=r[0], val=r[1];
+    if(typeof label!=="string" || !label.trim() || typeof val!=="number") return;
+    const hit=ASSUMP_PATTERNS.find(([re])=>re.test(label));
+    if(hit && hit[1]){ applied.push({label,key:hit[1],value:val}); }
+    else skipped.push(label);
+   });
+   log.push({sheet:"Assumptions",status:applied.length?"ok":"no recognisable rows — kept existing values",
+     n:applied.length, applied, skipped});
+  } else log.push({sheet:"Assumptions",status:"sheet not found — kept existing values",n:0});
+  D.assumpApplied=applied;
+ }
+
+ return {D,log};
+}
+
+async function handleWorkbookFile(file){
+ const box=$("#importStatus"); if(box) box.innerHTML=`<div class="note">Reading ${esc(file.name)}…</div>`;
+ try{
+  if(typeof XLSX==="undefined") throw new Error("The spreadsheet reader (SheetJS) did not load — check your internet connection and try again.");
+  const buf=await file.arrayBuffer();
+  const wb=XLSX.read(buf,{type:"array",cellDates:true});
+  const {D,log}=parseWorkbook(wb);
+  ["pv","inv","bat","dcb","mount","prot","tx","earth","civil","nem","labor","logi","dccable","accable","certs","loadlib","docs","sreda"]
+   .forEach(k=>{ if(D[k]) replaceArr(DB[k],D[k]); });
+  (D.assumpApplied||[]).forEach(a=>{ S.A[a.key]=a.value; });
+  S.srcFile={name:file.name,at:new Date().toLocaleString(),log};
+  IMPORT_LOG=log;
+  autoSelect();
+  render();
+  go("import");
+ }catch(e){
+  if(box) box.innerHTML=`<div class="note d"><b>Could not read that file.</b> ${esc(e.message)}<br>
+   Make sure it's an .xlsx workbook in the same layout as the source model (same sheet names). Nothing on the platform was changed.</div>`;
+ }
+}
+
+function renderImport(){
+ const f=S.srcFile;
+ $("#importUI").innerHTML=`
+ <div class="card"><h3>Upload</h3><div class="cb">
+  <label class="btn a" style="cursor:pointer;display:inline-block">Choose .xlsx file
+   <input type="file" id="wbFile" accept=".xlsx,.xls" style="display:none"></label>
+  <span class="sm mut" style="margin-left:10px">Same sheet names as the original workbook (PV Modules, Inverters, Battery Storage, Assumptions, Circulars, SREDA Approved Equipment (NEM), and so on). Sheets it doesn't recognise are left untouched — nothing is deleted.</span>
+  <div id="importStatus" style="margin-top:12px"></div>
+ </div></div>
+
+ ${f?`<div class="card"><h3>Last import<small>${esc(f.at)}</small></h3><div class="cb">
+  <p class="sm"><b>${esc(f.name)}</b></p>
+  <table><thead><tr><th>Sheet</th><th class="n">Records</th><th>Result</th></tr></thead><tbody>
+  ${f.log.filter(l=>l.sheet!=="Assumptions").map(l=>`<tr><td>${esc(l.sheet)}</td><td class="n">${l.n||"—"}</td>
+   <td><span class="tag ${l.status==='ok'?'ok':'no'}">${esc(l.status)}</span></td></tr>`).join("")}
+  </tbody></table>
+  ${(()=>{const a=f.log.find(l=>l.sheet==="Assumptions");
+    if(!a) return "";
+    return `<h4 style="margin-top:14px;font-size:12px;color:var(--amber-d);letter-spacing:.05em">ASSUMPTIONS SHEET</h4>
+    ${a.applied&&a.applied.length?`<table><thead><tr><th>Label in your file</th><th>Matched to</th><th class="n">Value applied</th></tr></thead><tbody>
+     ${a.applied.map(x=>`<tr><td class="sm">${esc(x.label)}</td><td class="mono sm">${esc(x.key)}</td><td class="n mono">${x.value}</td></tr>`).join("")}
+    </tbody></table>`:`<div class="note w">No assumption rows were confidently matched by label — existing values were kept. Assumption labels are matched by keyword (e.g. a row containing "VAT" updates the VAT rate); rename rows to match if you want them picked up.</div>`}
+    ${a.skipped&&a.skipped.length?`<div class="sm mut" style="margin-top:8px">Not matched to a known assumption, left as text/reference only: ${a.skipped.slice(0,12).map(esc).join(" · ")}${a.skipped.length>12?" …":""}</div>`:""}`;
+  })()}
+ </div></div>`:`<div class="card"><h3>No file imported yet</h3><div class="cb">
+  <p class="sm">The platform is currently running on the source workbook it was built from. Upload your own copy above — after editing prices, adding products, or updating assumptions in Excel — to have every page recalculate from your numbers instead.</p>
+ </div></div>`}
+
+ <div class="card"><h3>What gets replaced</h3><div class="cb">
+  <table><thead><tr><th>Sheet in your workbook</th><th>Replaces</th></tr></thead><tbody>
+   <tr><td>PV Modules</td><td class="sm mut">The entire PV module catalogue on the Equipment page</td></tr>
+   <tr><td>Inverters, Battery Storage</td><td class="sm mut">The inverter and battery catalogues</td></tr>
+   <tr><td>DC Combiner Boxes, Mounting Structure, Cabling (DC &amp; AC), Protection Equipment, Transformer &amp; HT Switchgear, Earthing &amp; Lightning Protection, Civil &amp; Structural Works, Net Metering &amp; Interconnection, Installation &amp; Labor, Transportation &amp; Logistics</td><td class="sm mut">The matching balance-of-system catalogues</td></tr>
+   <tr><td>Certifications &amp; Approvals</td><td class="sm mut">The certifications checklist on the Equipment page</td></tr>
+   <tr><td>Load Calculation</td><td class="sm mut">The reference load-type library (not your own entered equipment schedule, which is left alone)</td></tr>
+   <tr><td>Circulars</td><td class="sm mut">The policy &amp; circular library on the Bangladesh RE page</td></tr>
+   <tr><td>SREDA Approved Equipment (NEM)</td><td class="sm mut">The type-tested module register</td></tr>
+   <tr><td>Assumptions</td><td class="sm mut">Matched by label keyword against the known assumption set — see the import log above for exactly what changed</td></tr>
+  </tbody></table>
+  <div class="note">Your project inputs — location, load schedule, roof area, equipment selections, financing assumptions you've edited by hand — are not touched by an import. If an equipment selection no longer exists in the new catalogue, the platform falls back to the first available item in that category and flags it.</div>
+ </div></div>`;
+}
 </script></body></html>
